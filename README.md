@@ -13,6 +13,7 @@ The project explores low-level TCP networking, append-only log design, and event
 - Implemented ShardedLedgerWriter to route writes to per-shard append-only log files
 - Upgraded read protocol to shard-aware consumption READ,<shardId>,<offset>,<maxLines>
 - Centralized shard routing and file resolution using ShardRouter
+- Added META command to expose shard count dynamically and remove hardcoded shard assumptions from clients
 
 Next expected steps
 

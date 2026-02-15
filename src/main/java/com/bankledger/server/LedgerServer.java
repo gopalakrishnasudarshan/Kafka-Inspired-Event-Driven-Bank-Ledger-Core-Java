@@ -70,13 +70,20 @@ public class LedgerServer {
                 handleRead(line,out, router);
                 return;
             }
+            if (line.equals("META")) {
+                handleMeta(out, router);
+                return;
+            }
+
 
             try {
+
                 Transaction txn = parseToTransaction(line);
                 ledgerWriter.append(txn);
 
+                int shardId = router.shardForAccount(txn.getAccountId());
+                out.println("OK," + txn.getTransactionId() + "," + shardId);
                 System.out.println("Transaction Saved: " + txn);
-                out.println("OK," + txn.getTransactionId());
             } catch (IllegalArgumentException e) {
                 out.println("ERROR,invalid BAD_REQUEST");
             }
@@ -84,6 +91,10 @@ public class LedgerServer {
         } catch (IOException e) {
             e.printStackTrace();
         }
+    }
+
+    private static void handleMeta(PrintWriter out, ShardRouter router) {
+        out.println("OK,META," + router.shardCount());
     }
 
     private static Transaction parseToTransaction(String line) {
