@@ -14,6 +14,8 @@ The project explores low-level TCP networking, append-only log design, and event
 - Upgraded read protocol to shard-aware consumption READ,<shardId>,<offset>,<maxLines>
 - Centralized shard routing and file resolution using ShardRouter
 - Added META command to expose shard count dynamically and remove hardcoded shard assumptions from clients
+- Implemented reusable LedgerTcpClient abstraction to encapsulate META and shard-aware READ protocol handling with one request per connection 
+- Designed and added durable per shard offset management using offsetStore and FileOffsetStore 
 
 Next expected steps
 
