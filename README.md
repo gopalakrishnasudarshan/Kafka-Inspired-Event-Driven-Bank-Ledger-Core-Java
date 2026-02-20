@@ -16,8 +16,9 @@ The project explores low-level TCP networking, append-only log design, and event
 - Added META command to expose shard count dynamically and remove hardcoded shard assumptions from clients
 - Implemented reusable LedgerTcpClient abstraction to encapsulate META and shard-aware READ protocol handling with one request per connection 
 - Designed and added durable per shard offset management using offsetStore and FileOffsetStore 
+- - Implemented independent consumer services with per-shard offset tracking
 
 Next expected steps
 
-- Implement independent consumer services with per-shard offset tracking
+
 - Add durable offset persistence and basic fault-tolerance mechanisms

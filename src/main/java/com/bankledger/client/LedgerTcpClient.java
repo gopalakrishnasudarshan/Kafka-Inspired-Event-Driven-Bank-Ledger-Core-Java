@@ -28,7 +28,7 @@ public class LedgerTcpClient {
         }
 
         String [] parts = response.split(",");
-        if(parts.length != 3 || !"OK".equals(parts[0]) || "META".equals(parts[1])){
+        if(parts.length != 3 || !"OK".equals(parts[0]) || !"META".equals(parts[1])){
             throw new IOException("Invalid META response: "+ response);
         }
         try {
@@ -39,7 +39,7 @@ public class LedgerTcpClient {
     }
 
     public ReadResult read(int shardId, int offset, int maxLines) throws IOException {
-        String request = "READ" + shardId +","+offset+","+maxLines;
+        String request = "READ," + shardId + "," + offset + "," + maxLines;
 
         try(Socket socket = new Socket(host,port);
             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
@@ -55,7 +55,7 @@ public class LedgerTcpClient {
             }
 
             String [] parts = header.split(",");
-            if(parts.length != 4 || !"OK".equals(parts[0]) || "READ".equals(parts[1])){
+            if(parts.length != 4 || !"OK".equals(parts[0]) || !"READ".equals(parts[1])){
                 throw new IOException("INVALID READ header"+ header);
             }
             int respShardId;
