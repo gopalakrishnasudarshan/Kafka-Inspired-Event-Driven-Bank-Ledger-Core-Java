@@ -2,7 +2,7 @@ package com.bankledger.server;
 
 import com.bankledger.model.Transaction;
 import com.bankledger.model.TransactionType;
-import com.bankledger.storage.LedgerWriter;
+import com.bankledger.replication.ReplicaManager;
 import com.bankledger.storage.ShardRouter;
 import com.bankledger.storage.ShardedLedgerWriter;
 import com.bankledger.storage.partition.HashPartitionStrategy;
@@ -12,51 +12,62 @@ import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.file.Path;
+import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class LedgerServer {
 
-    private static final int PORT = 9090;
-    private static final Path LOG_PATH = Path.of("transactions.log");
     private static final AtomicLong TXN_ID_SEQ = new AtomicLong(1);
-    private static final ExecutorService pool = Executors.newFixedThreadPool(3);
-    private static final int SHARD_COUNT = 3;
     private static final Path BASE_DIR = Path.of(".");
     private static final String FILE_PREFIX = "transactions";
 
-    public static void main(String[] args) throws IOException {
+    private final LedgerServerConfig config;
+    private final ExecutorService pool;
 
-        PartitionStrategy partitionStrategy = new HashPartitionStrategy(SHARD_COUNT);
-        ShardRouter router = new ShardRouter(BASE_DIR,FILE_PREFIX,partitionStrategy);
-        ShardedLedgerWriter shardedLedgerWriter = new ShardedLedgerWriter(router);
+    private final ShardRouter router;
+    private final ShardedLedgerWriter ledgerWriter;
 
-        // When the application is terminated , this makes sure the thread pool is shut down gracefully.
-        //To make sure that the worker threads are not left running and ensures server exits cleanly.
+    private final ReplicaManager replicaManager;
+
+    public LedgerServer(LedgerServerConfig config) throws Exception {
+        this.config = config;
+
+        this.pool = Executors.newFixedThreadPool(config.getWorkerThreads());
+
+        PartitionStrategy partitionStrategy = new HashPartitionStrategy(config.getShardCount());
+        this.router = new ShardRouter(BASE_DIR, FILE_PREFIX, partitionStrategy);
+        this.ledgerWriter = new ShardedLedgerWriter(router);
+
+        if (config.getRole() == ServerRole.LEADER) {
+            this.replicaManager = new ReplicaManager(
+                    config.getReplicaAddress(),
+                    config.getReplicationTimeoutMs()
+            );
+        } else {
+            this.replicaManager = null;
+        }
+
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             pool.shutdown();
+            if (replicaManager != null) replicaManager.close();
         }));
+    }
 
-        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
-            System.out.println("Ledgerserver is listening on port " + PORT);
-
-
+    public void start() throws IOException {
+        try (ServerSocket serverSocket = new ServerSocket(config.getPort())) {
+            System.out.println("LedgerServer (" + config.getRole() + ") listening on port " + config.getPort());
 
             while (true) {
                 Socket client = serverSocket.accept();
-                pool.submit(() ->
-
-                        handleClient(client, shardedLedgerWriter, router));
+                pool.submit(() -> handleClient(client));
             }
         }
-
-
     }
 
-    private static void handleClient(Socket client, ShardedLedgerWriter ledgerWriter, ShardRouter router) {
+    private void handleClient(Socket client) {
         try (client;
-
              BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
              PrintWriter out = new PrintWriter(client.getOutputStream(), true)) {
 
@@ -65,27 +76,57 @@ public class LedgerServer {
                 out.println("ERROR,EMPTY_REQUEST");
                 return;
             }
-            if(line.startsWith("READ,"))
-            {
-                handleRead(line,out, router);
-                return;
-            }
+
+            // META
             if (line.equals("META")) {
-                handleMeta(out, router);
+                out.println("OK,META," + router.shardCount());
                 return;
             }
 
+            // READ
+            if (line.startsWith("READ,")) {
+                handleRead(line, out);
+                return;
+            }
+
+            // REPL_APPEND (replica-only)
+            if (line.startsWith("REPL_APPEND,")) {
+                if (config.getRole() != ServerRole.REPLICA) {
+                    out.println("ERROR,NOT_REPLICA");
+                    return;
+                }
+                handleReplicaAppend(line, out);
+                return;
+            }
+
+            // Client writes (leader-only)
+            if (config.getRole() != ServerRole.LEADER) {
+                out.println("ERROR,NOT_LEADER");
+                return;
+            }
 
             try {
-
                 Transaction txn = parseToTransaction(line);
-                ledgerWriter.append(txn);
+
+                // returns the exact txLine appended (no trailing newline)
+                String txLine = ledgerWriter.append(txn);
 
                 int shardId = router.shardForAccount(txn.getAccountId());
-                out.println("OK," + txn.getTransactionId() + "," + shardId);
-                System.out.println("Transaction Saved: " + txn);
+                long txId = txn.getTransactionId();
+
+                boolean replicated = true;
+                if (replicaManager != null) {
+                    replicated = replicaManager.replicateToAll(shardId, txLine, txId);
+                }
+
+                if (replicated) {
+                    out.println("OK," + txId + "," + shardId);
+                } else {
+                    out.println("ERR,REPLICATION_FAILED," + txId);
+                }
+
             } catch (IllegalArgumentException e) {
-                out.println("ERROR,invalid BAD_REQUEST");
+                out.println("ERROR,BAD_REQUEST");
             }
 
         } catch (IOException e) {
@@ -93,11 +134,41 @@ public class LedgerServer {
         }
     }
 
-    private static void handleMeta(PrintWriter out, ShardRouter router) {
-        out.println("OK,META," + router.shardCount());
+    private void handleReplicaAppend(String line, PrintWriter out) {
+        // Format: REPL_APPEND,<shardId>,<txLine>
+        String[] parts = line.split(",", 3);
+        if (parts.length < 3) {
+            out.println("ERROR,BAD_REQUEST");
+            return;
+        }
+
+        int shardId;
+        try {
+            shardId = Integer.parseInt(parts[1].trim());
+        } catch (NumberFormatException e) {
+            out.println("ERROR,BAD_REQUEST");
+            return;
+        }
+
+        String txLine = parts[2];
+
+        long txId;
+        try {
+            txId = Long.parseLong(txLine.split(",", 2)[0]);
+        } catch (Exception e) {
+            out.println("ERROR,BAD_REQUEST");
+            return;
+        }
+
+        try {
+            ledgerWriter.appendReplica(shardId, txLine);
+            out.println("ACK," + txId);
+        } catch (Exception e) {
+            out.println("ERROR,REPL_APPEND_FAILED");
+        }
     }
 
-    private static Transaction parseToTransaction(String line) {
+    private Transaction parseToTransaction(String line) {
         String[] parts = line.split(",");
         if (parts.length != 3) {
             throw new IllegalArgumentException("Invalid request format. Expected: accountId,type,amount");
@@ -113,10 +184,9 @@ public class LedgerServer {
         return new Transaction(txnId, accountId, type, amount, timestamp);
     }
 
-    private static void handleRead(String line, PrintWriter out, ShardRouter router) {
-        String [] parts = line.split(",");
-        if(parts.length != 4)
-        {
+    private void handleRead(String line, PrintWriter out) {
+        String[] parts = line.split(",");
+        if (parts.length != 4) {
             out.println("ERROR,BAD_READ_REQUEST");
             return;
         }
@@ -124,59 +194,115 @@ public class LedgerServer {
         int shardId;
         int offset;
         int maxLines;
+
         try {
             shardId = Integer.parseInt(parts[1].trim());
             offset = Integer.parseInt(parts[2].trim());
             maxLines = Integer.parseInt(parts[3].trim());
-        }catch (NumberFormatException e)
-        {
+        } catch (NumberFormatException e) {
             out.println("ERROR,BAD_READ_REQUEST");
             return;
         }
 
-        if(shardId < 0 || shardId >= SHARD_COUNT || offset < 0 || maxLines < 0)
-        {
+        if (offset < 0 || maxLines < 0) {
             out.println("ERROR,BAD_READ_REQUEST");
             return;
         }
 
-        Path shardPath = router.shardPath(shardId);
-        String [] buffer = new String[maxLines];
-        int sent = 0 ;
+        Path logPath = router.shardPath(shardId);
+        Path indexPath = Path.of(logPath.toString() + ".index");
 
-        try(BufferedReader reader = new BufferedReader(new FileReader(shardPath.toFile()))) {
+        try (RandomAccessFile indexFile = new RandomAccessFile(indexPath.toFile(), "r");
+             RandomAccessFile logFile = new RandomAccessFile(logPath.toFile(), "r")) {
 
-            for (int i = 0 ; i < offset; i++)
-            {
-                if(reader.readLine() == null)
-                {
-                    out.println("OK,READ," + shardId + "," + offset);
-                    out.println("END");
-                    return;
+            long bytePosition = -1;
+            int currentLine = 0;
+            String indexLine;
+
+            while ((indexLine = indexFile.readLine()) != null) {
+                if (currentLine == offset) {
+                    String[] idxParts = indexLine.split(",");
+                    bytePosition = Long.parseLong(idxParts[1]);
+                    break;
                 }
+                currentLine++;
             }
 
+            if (bytePosition == -1) {
+                out.println("OK,READ," + shardId + "," + offset);
+                out.println("END");
+                return;
+            }
+
+            logFile.seek(bytePosition);
+
+            List<String> buffer = new ArrayList<>();
             String txnLine;
-            while(sent < maxLines &&(txnLine = reader.readLine()) != null){
-               buffer[sent++] = txnLine;
+
+            while (buffer.size() < maxLines && (txnLine = logFile.readLine()) != null) {
+                buffer.add(txnLine);
             }
 
-            int nextOffset = offset + sent;
-            out.println("OK,READ," +shardId+ "," +nextOffset);
-            for (int i = 0; i < sent; i++) {
-                out.println(buffer[i]);
-            }
+            int nextOffset = offset + buffer.size();
+
+            out.println("OK,READ," + shardId + "," + nextOffset);
+            for (String l : buffer) out.println(l);
             out.println("END");
 
-
-        }catch (FileNotFoundException e) {
+        } catch (FileNotFoundException e) {
             out.println("OK,READ," + shardId + "," + offset);
             out.println("END");
-        }catch (IOException e) {
+        } catch (IOException e) {
             out.println("ERROR,READ_FAILED");
         }
-
     }
 
+    public static void main(String[] args) throws Exception {
+        // Supported args (any order):
+        // --role=LEADER|REPLICA
+        // --port=9090
+        // --shards=3
+        // --threads=3
+        // --replicas=localhost:9091,localhost:9092   (leader only)
+        // --leader=localhost:9090                     (replica optional)
+        // --timeoutMs=2000
 
+        Map<String, String> m = new HashMap<>();
+        for (String a : args) {
+            if (a.startsWith("--") && a.contains("=")) {
+                String[] p = a.substring(2).split("=", 2);
+                m.put(p[0].trim(), p[1].trim());
+            }
+        }
+
+        ServerRole role = ServerRole.valueOf(m.getOrDefault("role", "LEADER").toUpperCase());
+        int port = Integer.parseInt(m.getOrDefault("port", "9090"));
+        int shards = Integer.parseInt(m.getOrDefault("shards", "3"));
+        int threads = Integer.parseInt(m.getOrDefault("threads", "3"));
+        int timeoutMs = Integer.parseInt(m.getOrDefault("timeoutMs", "2000"));
+
+        List<String> replicas = List.of();
+        String repStr = m.getOrDefault("replicas", "");
+        if (!repStr.isBlank()) {
+            replicas = Arrays.stream(repStr.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isBlank())
+                    .toList();
+        }
+
+        String leaderAddr = m.getOrDefault("leader", null);
+
+
+        LedgerServerConfig config = new LedgerServerConfig(
+                role,
+                port,
+                shards,
+                replicas,
+                leaderAddr,
+                timeoutMs,
+                threads
+        );
+
+        new LedgerServer(config).start();
+    }
 }
