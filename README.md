@@ -1,26 +1,58 @@
-A Kafka-inspired, event-driven banking ledger being built using pure Core Java.
+# Kafka-Inspired Distributed Banking Ledger (Core Java)
 
-The project explores low-level TCP networking, append-only log design, and event-driven system fundamentals without using frameworks.
+A Kafka-inspired, event-driven distributed banking ledger built using pure Core Java (no frameworks).
 
- Current work done: Implement concurrent client handling and add offset-based ledger read support
+This project implements the core mechanics of a distributed log system from scratch, focusing on storage, partitioning, replication, and offset-based consumption.
 
-- Introduced fixed thread pool in LedgerServer for multi-client handling
-- Made LedgerWriter.append() thread-safe using synchronized
-- Added graceful shutdown hook for ExecutorService
-- Implemented READ,<offset>,<maxLines> protocol for ledger consumption
-- Added basic offset-based log reading with bounded response and END marker
-- Introduced deterministic account-based sharding using PartitionStrategy
-- Implemented ShardedLedgerWriter to route writes to per-shard append-only log files
-- Upgraded read protocol to shard-aware consumption READ,<shardId>,<offset>,<maxLines>
-- Centralized shard routing and file resolution using ShardRouter
-- Added META command to expose shard count dynamically and remove hardcoded shard assumptions from clients
-- Implemented reusable LedgerTcpClient abstraction to encapsulate META and shard-aware READ protocol handling with one request per connection 
-- Designed and added durable per shard offset management using offsetStore and FileOffsetStore 
-- Implemented independent consumer services with per-shard offset tracking
-- Implemented leader–replica synchronous replication with ACK=ALL write guarantees 
-- Introduced server roles (LEADER/REPLICA) with replication protocol using REPL_APPEND and ACK for durable log consistency
+---
 
-Next expected steps
+## Architecture Overview
 
+### Partitioned Append-Only Log
+- Deterministic account-based sharding
+- Multiple shard files (`transactions_0.log`, etc.)
+- Strict ordering per shard
+- Offset → byte index for fast reads
+- Fully append-only storage
 
-- Idempotent replication (duplicate protection) on replicas (sequence/last-applied tracking per shard).
+### Offset-Based Consumption
+- Stateless server-side reads
+- `READ,<shardId>,<offset>,<maxLines>` protocol
+- Durable per-shard consumer offset persistence
+- Independent consumer groups
+
+### Synchronous Replication
+- Leader–Replica model
+- ACK=ALL semantics
+- No success response unless replicas persist data
+- Per-shard ordered replication
+
+### Idempotent Replication
+- Monotonic replication sequence per shard
+- Duplicate-safe appends
+- Strict ordering enforcement on replicas
+
+---
+
+## System Guarantees
+
+- Deterministic partitioning
+- Immutable append-only log
+- Indexed fast reads
+- Independent consumers
+- Durable replication
+- Duplicate-safe replication
+
+---
+
+## Tech Stack
+
+- Core Java
+- TCP sockets
+- ExecutorService (thread pools)
+- RandomAccessFile (log + index)
+- No external frameworks
+
+---
+
+This project demonstrates how distributed log systems like Kafka work internally, implemented entirely from first principles.
