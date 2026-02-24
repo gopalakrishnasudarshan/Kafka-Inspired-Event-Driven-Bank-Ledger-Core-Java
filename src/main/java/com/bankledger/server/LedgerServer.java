@@ -3,6 +3,7 @@ package com.bankledger.server;
 import com.bankledger.model.Transaction;
 import com.bankledger.model.TransactionType;
 import com.bankledger.replication.ReplicaManager;
+import com.bankledger.storage.LedgerWriter;
 import com.bankledger.storage.ShardRouter;
 import com.bankledger.storage.ShardedLedgerWriter;
 import com.bankledger.storage.partition.HashPartitionStrategy;
@@ -31,6 +32,9 @@ public class LedgerServer {
 
     private final ReplicaManager replicaManager;
 
+    private final long [] nextReplicationSeq;
+    private final Object[] shardLocks;
+
     public LedgerServer(LedgerServerConfig config) throws Exception {
         this.config = config;
 
@@ -47,6 +51,18 @@ public class LedgerServer {
             );
         } else {
             this.replicaManager = null;
+        }
+
+        this.nextReplicationSeq = new long[router.shardCount()];
+        if (config.getRole() == ServerRole.LEADER) {
+            for (int s = 0; s < router.shardCount(); s++) {
+                long last = ledgerWriter.lastReplicationSeq(s);
+                nextReplicationSeq[s] = last + 1;
+            }
+        }
+        this.shardLocks = new Object[router.shardCount()];
+        for (int i = 0; i < shardLocks.length; i++) {
+            shardLocks[i] = new Object();
         }
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -71,62 +87,72 @@ public class LedgerServer {
              BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
              PrintWriter out = new PrintWriter(client.getOutputStream(), true)) {
 
-            String line = in.readLine();
-            if (line == null || line.isBlank()) {
-                out.println("ERROR,EMPTY_REQUEST");
-                return;
-            }
+            String line;
+            while ((line = in.readLine()) != null) {
 
-            // META
-            if (line.equals("META")) {
-                out.println("OK,META," + router.shardCount());
-                return;
-            }
-
-            // READ
-            if (line.startsWith("READ,")) {
-                handleRead(line, out);
-                return;
-            }
-
-            // REPL_APPEND (replica-only)
-            if (line.startsWith("REPL_APPEND,")) {
-                if (config.getRole() != ServerRole.REPLICA) {
-                    out.println("ERROR,NOT_REPLICA");
-                    return;
-                }
-                handleReplicaAppend(line, out);
-                return;
-            }
-
-            // Client writes (leader-only)
-            if (config.getRole() != ServerRole.LEADER) {
-                out.println("ERROR,NOT_LEADER");
-                return;
-            }
-
-            try {
-                Transaction txn = parseToTransaction(line);
-
-                // returns the exact txLine appended (no trailing newline)
-                String txLine = ledgerWriter.append(txn);
-
-                int shardId = router.shardForAccount(txn.getAccountId());
-                long txId = txn.getTransactionId();
-
-                boolean replicated = true;
-                if (replicaManager != null) {
-                    replicated = replicaManager.replicateToAll(shardId, txLine, txId);
+                if (line.isBlank()) {
+                    out.println("ERROR,EMPTY_REQUEST");
+                    continue;
                 }
 
-                if (replicated) {
-                    out.println("OK," + txId + "," + shardId);
-                } else {
-                    out.println("ERR,REPLICATION_FAILED," + txId);
+                // META
+                if (line.equals("META")) {
+                    out.println("OK,META," + router.shardCount());
+                    continue;
                 }
 
-            } catch (IllegalArgumentException e) {
-                out.println("ERROR,BAD_REQUEST");
+                // READ
+                if (line.startsWith("READ,")) {
+                    handleRead(line, out);
+                    continue;
+                }
+
+                // REPL_APPEND (replica-only)
+                if (line.startsWith("REPL_APPEND,")) {
+                    if (config.getRole() != ServerRole.REPLICA) {
+                        out.println("ERROR,NOT_REPLICA");
+                        continue;
+                    }
+                    handleReplicaAppend(line, out);
+                    continue;
+                }
+
+                // Client writes (leader-only)
+                if (config.getRole() != ServerRole.LEADER) {
+                    out.println("ERROR,NOT_LEADER");
+                    continue;
+                }
+
+                try {
+                    Transaction txn = parseToTransaction(line);
+
+                    int shardId = router.shardForAccount(txn.getAccountId());
+
+                    // enforce per-shard ordering for seq + replicate
+                    synchronized (shardLocks[shardId]) {
+
+                        long txId = txn.getTransactionId();
+
+                        long seq = nextReplicationSeq[shardId];
+                        nextReplicationSeq[shardId] = seq + 1;
+
+                        String txLine = ledgerWriter.appendWithReplicationSeq(txn, seq);
+
+                        boolean replicated = true;
+                        if (replicaManager != null) {
+                            replicated = replicaManager.replicateToAll(shardId, txLine, txId);
+                        }
+
+                        if (replicated) {
+                            out.println("OK," + txId + "," + shardId);
+                        } else {
+                            out.println("ERR,REPLICATION_FAILED," + txId);
+                        }
+                    }
+
+                } catch (IllegalArgumentException e) {
+                    out.println("ERROR,BAD_REQUEST");
+                }
             }
 
         } catch (IOException e) {
@@ -161,12 +187,23 @@ public class LedgerServer {
         }
 
         try {
-            ledgerWriter.appendReplica(shardId, txLine);
+            LedgerWriter.ReplicaAppendResult r = ledgerWriter.appendReplicaIdempotent(shardId, txLine);
+
+            if (r == LedgerWriter.ReplicaAppendResult.GAP_DETECTED) {
+                out.println("ERROR,GAP");
+                return;
+            }
+
+
             out.println("ACK," + txId);
+
+        } catch (IllegalArgumentException e) {
+            out.println("ERROR,BAD_REQUEST");
         } catch (Exception e) {
             out.println("ERROR,REPL_APPEND_FAILED");
         }
     }
+
 
     private Transaction parseToTransaction(String line) {
         String[] parts = line.split(",");

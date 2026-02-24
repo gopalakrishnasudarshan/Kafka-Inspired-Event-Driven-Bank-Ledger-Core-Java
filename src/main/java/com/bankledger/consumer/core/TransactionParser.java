@@ -14,7 +14,7 @@ public class TransactionParser {
         }
 
         String[] parts = line.split(",");
-        if (parts.length != 5) {
+        if (parts.length < 5) {
             throw new IllegalArgumentException("Invalid transaction log format: " + line);
         }
 

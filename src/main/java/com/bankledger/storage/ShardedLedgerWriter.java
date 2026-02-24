@@ -26,8 +26,28 @@ public class ShardedLedgerWriter {
         return writers[shard].append(transaction); // change LedgerWriter.append to return String
     }
 
+    public String appendWithReplicationSeq(Transaction transaction, long replicationSeq) throws IOException {
+        int shard = router.shardForAccount(transaction.getAccountId());
+
+        String txLine =
+                transaction.getTransactionId() + "," +
+                        transaction.getAccountId() + "," +
+                        transaction.getTransactionType() + "," +
+                        transaction.getAmount() + "," +
+                        transaction.getTimestamp() + "," +
+                        replicationSeq;
+
+        return writers[shard].appendLine(txLine);
+    }
+    public LedgerWriter.ReplicaAppendResult appendReplicaIdempotent(int shardId, String txLine) throws IOException {
+        return writers[shardId].appendReplicaIdempotent(txLine);
+    }
+
 
     public void appendReplica(int shardId, String txLine) throws IOException {
         writers[shardId].appendReplica(txLine);
+    }
+    public long lastReplicationSeq(int shardId) {
+        return writers[shardId].getLastReplicationSeq();
     }
 }

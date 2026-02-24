@@ -18,6 +18,8 @@ public class LedgerWriter {
 
     private long nextOffset = 0;
 
+    private long lastReplicationSeq = 0;
+
     public LedgerWriter(Path logPath) {
         try {
             this.logPath = logPath;
@@ -41,6 +43,7 @@ public class LedgerWriter {
 
     private void rebuildIndexAndOffset() throws IOException {
         nextOffset = 0;
+        lastReplicationSeq = 0;
         indexFile.setLength(0); // rebuild fresh
 
         logFile.seek(0);
@@ -52,6 +55,11 @@ public class LedgerWriter {
             // Record offset -> byte position
             String indexEntry = nextOffset + "," + bytePosition + "\n";
             indexFile.write(indexEntry.getBytes(StandardCharsets.UTF_8));
+
+            long seq = tryParseReplicationSeq(line);
+            if(seq > lastReplicationSeq){
+                lastReplicationSeq = seq;
+            }
 
             bytePosition = logFile.getFilePointer();
             nextOffset++;
@@ -82,7 +90,7 @@ public class LedgerWriter {
     }
 
 
-    public synchronized void appendReplica(String txLine) throws IOException {
+    public synchronized String appendReplica(String txLine) throws IOException {
 
         long bytePosition = logFile.length();
         logFile.seek(bytePosition);
@@ -94,13 +102,92 @@ public class LedgerWriter {
         indexFile.write(indexEntry.getBytes(StandardCharsets.UTF_8));
 
         nextOffset++;
+
+        long seq = tryParseReplicationSeq(txLine);
+        if(seq > lastReplicationSeq) {
+            lastReplicationSeq = seq;
+        }
+        return txLine;
     }
 
+    public synchronized String appendLine(String txLine) throws IOException {
+        long bytePosition = logFile.length();
+        logFile.seek(bytePosition);
+
+        byte[] bytes = (txLine + "\n").getBytes(StandardCharsets.UTF_8);
+        logFile.write(bytes);
+
+        String indexEntry = nextOffset + "," + bytePosition + "\n";
+        indexFile.write(indexEntry.getBytes(StandardCharsets.UTF_8));
+
+        nextOffset++;
+
+        long seq = tryParseReplicationSeq(txLine);
+        if (seq > lastReplicationSeq) {
+            lastReplicationSeq = seq;
+        }
+
+        return txLine;
+    }
+
+
+    public synchronized ReplicaAppendResult appendReplicaIdempotent(String txLine) throws IOException {
+        long seq = parseReplicationSeqRequired(txLine);
+
+        if (seq <= lastReplicationSeq) {
+            return ReplicaAppendResult.DUPLICATE_IGNORED;
+        }
+
+        if (seq != lastReplicationSeq + 1) {
+            return ReplicaAppendResult.GAP_DETECTED;
+        }
+
+        // Expected next
+        appendReplica(txLine);
+        // appendReplica updates lastReplicationSeq already, but keep explicit correctness:
+        lastReplicationSeq = seq;
+
+        return ReplicaAppendResult.APPENDED;
+    }
+
+    public synchronized long getLastReplicationSeq() {
+        return lastReplicationSeq;
+    }
+
+    private long tryParseReplicationSeq(String txLine) {
+        try {
+            String[] parts = txLine.split(",");
+            if (parts.length >= 6) {
+                return Long.parseLong(parts[5].trim());
+            }
+            return 0;
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+    private long parseReplicationSeqRequired(String txLine) {
+        try {
+            String[] parts = txLine.split(",");
+            if (parts.length < 6) {
+                throw new IllegalArgumentException("Missing replicationSeq field: " + txLine);
+            }
+            return Long.parseLong(parts[5].trim());
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Invalid replicationSeq field: " + txLine, e);
+        }
+    }
     private String toLine(Transaction transaction) {
         return transaction.getTransactionId() + "," +
                 transaction.getAccountId() + "," +
                 transaction.getTransactionType() + "," +
                 transaction.getAmount() + "," +
                 transaction.getTimestamp();
+    }
+
+    public enum ReplicaAppendResult {
+        APPENDED,
+        DUPLICATE_IGNORED,
+        GAP_DETECTED
     }
 }
